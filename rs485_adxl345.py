@@ -35,7 +35,9 @@ TABLE_HEADERS = ["Time", "Temperature (°C)", "Humidity (%)", "Wind Direction (�
 ADXL_PORT = "/dev/ttyUSB1"      # Cổng USB cắm mạch ADXL
 ADXL_BAUD = 115200
 PACKET_SIZE = 28
-NODES = {b'\xA5': 1, b'\xA6': 2}
+ADXL_SAMPLE_INTERVAL_US = 5000
+ADXL_FS_HZ = 200
+NODES = {b'\xA6': 2}  # CodeIDE.txt: POLL_CMD = 0xA6, NODE_ID = 2
 ADXL_HEADERS = ["pc_time", "node_id", "esp32_micros", "z_value"]
 
 # ================= REALTIME SERVER CONFIG ==================
@@ -126,7 +128,7 @@ class RealtimeSender(threading.Thread):
                     "device_id": self.device_id,
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "adxl_batch",
-                    "fs_hz": 500,
+                    "fs_hz": ADXL_FS_HZ,
                     "chunk_start_us": int(chunk[0][0]),
                     "samples": chunk
                 }
@@ -170,7 +172,7 @@ def calculate_checksum(data):
 # ================= ADXL SERIAL LOGGER THREAD ==================
 class ADXLLogger(threading.Thread):
     """
-    Đọc 2 ADXL345 qua Polling Serial (COM5) và ghép thành mảng 3 giá trị cho UI/Realtime
+    Đọc frame ADXL345 do node ESP32 trong CodeIDE.txt gửi qua polling serial.
     """
     def __init__(self, csv_path: Path, realtime_sender=None):
         super().__init__(daemon=True)
@@ -198,6 +200,7 @@ class ADXLLogger(threading.Thread):
         # Mở cổng Serial
         try:
             ser = serial.Serial(ADXL_PORT, ADXL_BAUD, timeout=0)
+            time.sleep(2)
             ser.reset_input_buffer()
         except Exception as e:
             print(f"Lỗi không mở được cổng {ADXL_PORT}: {e}")
@@ -247,7 +250,7 @@ class ADXLLogger(threading.Thread):
                                     # Gói tin hợp lệ: bóc 10 mẫu Z
                                     for i in range(10):
                                         z = struct.unpack('<h', packet[6 + i * 2: 8 + i * 2])[0]
-                                        sample_micros = start_micros + (i * 5000)
+                                        sample_micros = start_micros + (i * ADXL_SAMPLE_INTERVAL_US)
                                         
                                         # Cập nhật Cache an toàn
                                         with self._lock:
@@ -262,7 +265,7 @@ class ADXLLogger(threading.Thread):
                                         # Ghi log file
                                         writer.writerow([pc_time_str, node_id, sample_micros, z])
 
-                                        # Đẩy vào RealtimeSender (tương tự 500Hz cũ)
+                                        # Đẩy mẫu đồng bộ 200Hz vào RealtimeSender.
                                         if self.realtime_sender is not None:
                                             try:
                                                 self.realtime_sender.push_adxl_sample(curr_z1, curr_z2, curr_z3)
