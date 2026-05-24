@@ -34,11 +34,10 @@ TABLE_HEADERS = ["Time", "Temperature (°C)", "Humidity (%)", "Wind Direction (�
 # ================= CONFIG (ADXL qua Serial/USB) ==================
 ADXL_PORT = "/dev/ttyUSB1"      # Cổng USB cắm mạch ADXL
 ADXL_BAUD = 115200
-PACKET_SIZE = 28
-ADXL_SAMPLE_INTERVAL_US = 5000
+PACKET_SIZE = 26
 ADXL_FS_HZ = 200
 NODES = {b'\xA6': 2}  # CodeIDE.txt: POLL_CMD = 0xA6, NODE_ID = 2
-ADXL_HEADERS = ["pc_time", "node_id", "esp32_micros", "z_value"]
+ADXL_HEADERS = ["time", "node_id", "cnt", "z"]
 
 # ================= REALTIME SERVER CONFIG ==================
 SERVER_URL = "http://100.110.169.51:8080"
@@ -234,23 +233,23 @@ class ADXLLogger(threading.Thread):
                     if ser.in_waiting > 0:
                         raw_buffer.extend(ser.read(ser.in_waiting))
 
-                    # Bóc tách gói tin (Packet = 28 bytes)
+                    # Frame Arduino: header, node id, start_cnt, 10 x Z, checksum, footer.
                     while len(raw_buffer) >= PACKET_SIZE:
                         if raw_buffer[0] == 0xAA:
                             packet = raw_buffer[:PACKET_SIZE]
                             
                             # Kiểm tra byte kết thúc, node id và checksum
-                            if packet[27] == 0x55 and packet[1] == node_id:
-                                if packet[26] == calculate_checksum(packet[0:26]):
+                            if packet[25] == 0x55 and packet[1] == node_id:
+                                if packet[24] == calculate_checksum(packet[0:24]):
                                     now_dt = datetime.now()
-                                    pc_time_str = now_dt.strftime("%H:%M:%S.%f")[:-3]
-                                    start_micros = struct.unpack('<I', packet[2:6])[0]
+                                    now_str = now_dt.strftime("%H:%M:%S.%f")[:-3]
+                                    start_cnt = struct.unpack('<H', packet[2:4])[0]
                                     last_z = 0
 
                                     # Gói tin hợp lệ: bóc 10 mẫu Z
                                     for i in range(10):
-                                        z = struct.unpack('<h', packet[6 + i * 2: 8 + i * 2])[0]
-                                        sample_micros = start_micros + (i * ADXL_SAMPLE_INTERVAL_US)
+                                        z = struct.unpack('<h', packet[4 + i * 2: 6 + i * 2])[0]
+                                        curr_cnt = (start_cnt + i) % 65536
                                         
                                         # Cập nhật Cache an toàn
                                         with self._lock:
@@ -263,7 +262,7 @@ class ADXLLogger(threading.Thread):
                                             curr_z1, curr_z2, curr_z3 = self._latest_tuple
 
                                         # Ghi log file
-                                        writer.writerow([pc_time_str, node_id, sample_micros, z])
+                                        writer.writerow([now_str, node_id, curr_cnt, z])
 
                                         # Đẩy mẫu đồng bộ 200Hz vào RealtimeSender.
                                         if self.realtime_sender is not None:
@@ -275,8 +274,8 @@ class ADXLLogger(threading.Thread):
                                         last_z = z
 
                                     print(
-                                        f"[{pc_time_str}] Node {node_id} | "
-                                        f"Micros: {start_micros:10d} | "
+                                        f"[{now_str}] Node {node_id} | "
+                                        f"Cnt: {start_cnt:5d} | "
                                         f"Z_last: {last_z:5d}"
                                     )
 
