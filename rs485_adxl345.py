@@ -1,4 +1,4 @@
-import os, sys, time, threading
+import sys, time, threading
 import minimalmodbus
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +21,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 # ================= CONFIG (Môi trường) ==================
-PORT = os.environ.get("RS485_PORT", "/dev/ttyUSB0")
+PORT = "/dev/ttyUSB0"
 BAUD = 9600
 ID_TEMP_HUM = 1
 ID_WIND_SPD = 3
@@ -32,17 +32,14 @@ MAX_SAMPLES = 200
 TABLE_HEADERS = ["Time", "Temperature (°C)", "Humidity (%)", "Wind Direction (°)", "Wind Speed (m/s)"]
 
 # ================= CONFIG (ADXL qua Serial/USB) ==================
-ADXL_PORT = os.environ.get("ADXL_PORT", "/dev/ttyUSB1")
+ADXL_PORT = "/dev/ttyUSB1"      # Cổng USB cắm mạch ADXL
 ADXL_BAUD = 115200
 PACKET_SIZE = 28
-ADXL_SAMPLE_INTERVAL_US = 5000
-ADXL_FS_HZ = 1_000_000 // ADXL_SAMPLE_INTERVAL_US
 NODES = {b'\xA5': 1, b'\xA6': 2}
-NODE_IDS = set(NODES.values())
 ADXL_HEADERS = ["pc_time", "node_id", "esp32_micros", "z_value"]
 
 # ================= REALTIME SERVER CONFIG ==================
-SERVER_URL = "http://100.67.214.32:8000"
+SERVER_URL = "http://100.110.169.51:8080"
 API_KEY    = "iotserver"
 DEVICE_ID  = "raspi-01"
 
@@ -80,15 +77,9 @@ class RealtimeSender(threading.Thread):
         with self._lock:
             self._rs485_buf.append(sample)
 
-    def push_adxl_sample(self, node_id: int, esp32_micros: int, z_value: int,
-                         z1: int, z2: int, z3: int):
+    def push_adxl_sample(self, z1: int, z2: int, z3: int):
         with self._lock:
-            self._adxl_buf.append({
-                "node_id": int(node_id),
-                "esp32_micros": int(esp32_micros),
-                "z_value": int(z_value),
-                "values": [int(z1), int(z2), int(z3)],
-            })
+            self._adxl_buf.append([int(z1), int(z2), int(z3)])
 
     def _post(self, body: dict):
         self._sess.post(
@@ -135,12 +126,9 @@ class RealtimeSender(threading.Thread):
                     "device_id": self.device_id,
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "type": "adxl_batch",
-                    "fs_hz": ADXL_FS_HZ,
-                    "chunk_start_us": int(chunk[0]["esp32_micros"]),
-                    "sample_times_us": [item["esp32_micros"] for item in chunk],
-                    "sample_node_ids": [item["node_id"] for item in chunk],
-                    "sample_values": [item["z_value"] for item in chunk],
-                    "samples": [item["values"] for item in chunk],
+                    "fs_hz": 500,
+                    "chunk_start_us": int(chunk[0][0]),
+                    "samples": chunk
                 }
                 try:
                     self._post(body)
@@ -182,7 +170,7 @@ def calculate_checksum(data):
 # ================= ADXL SERIAL LOGGER THREAD ==================
 class ADXLLogger(threading.Thread):
     """
-    Doc 2 ADXL345 qua polling Serial va luu timestamp lay mau tu ESP32.
+    Đọc 2 ADXL345 qua Polling Serial (COM5) và ghép thành mảng 3 giá trị cho UI/Realtime
     """
     def __init__(self, csv_path: Path, realtime_sender=None):
         super().__init__(daemon=True)
@@ -243,49 +231,52 @@ class ADXLLogger(threading.Thread):
                     if ser.in_waiting > 0:
                         raw_buffer.extend(ser.read(ser.in_waiting))
 
-                    # Packet: header, node id, start_micros, 10 x Z, checksum, footer.
+                    # Bóc tách gói tin (Packet = 28 bytes)
                     while len(raw_buffer) >= PACKET_SIZE:
                         if raw_buffer[0] == 0xAA:
                             packet = raw_buffer[:PACKET_SIZE]
-                            packet_node_id = packet[1]
-                             
+                            
                             # Kiểm tra byte kết thúc, node id và checksum
-                            if packet[27] == 0x55 and packet_node_id in NODE_IDS:
+                            if packet[27] == 0x55 and packet[1] == node_id:
                                 if packet[26] == calculate_checksum(packet[0:26]):
-                                    pc_time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                                    now_dt = datetime.now()
+                                    pc_time_str = now_dt.strftime("%H:%M:%S.%f")[:-3]
                                     start_micros = struct.unpack('<I', packet[2:6])[0]
-                                    
+                                    last_z = 0
+
                                     # Gói tin hợp lệ: bóc 10 mẫu Z
                                     for i in range(10):
                                         z = struct.unpack('<h', packet[6 + i * 2: 8 + i * 2])[0]
-                                        sample_micros = (
-                                            start_micros + i * ADXL_SAMPLE_INTERVAL_US
-                                        ) & 0xFFFFFFFF
+                                        sample_micros = start_micros + (i * 5000)
                                         
                                         # Cập nhật Cache an toàn
                                         with self._lock:
-                                            if packet_node_id == 1:
+                                            if node_id == 1:
                                                 self.latest_z1 = z
-                                            elif packet_node_id == 2:
+                                            elif node_id == 2:
                                                 self.latest_z2 = z
-                                             
+                                            
                                             self._latest_tuple = (self.latest_z1, self.latest_z2, self.latest_z3)
                                             curr_z1, curr_z2, curr_z3 = self._latest_tuple
 
                                         # Ghi log file
-                                        writer.writerow([pc_time_str, packet_node_id, sample_micros, z])
+                                        writer.writerow([pc_time_str, node_id, sample_micros, z])
 
-                                        # Day mau kem timestamp ESP32 vao RealtimeSender.
+                                        # Đẩy vào RealtimeSender (tương tự 500Hz cũ)
                                         if self.realtime_sender is not None:
                                             try:
-                                                self.realtime_sender.push_adxl_sample(
-                                                    packet_node_id, sample_micros, z,
-                                                    curr_z1, curr_z2, curr_z3
-                                                )
+                                                self.realtime_sender.push_adxl_sample(curr_z1, curr_z2, curr_z3)
                                             except Exception:
                                                 pass
 
-                                    csv_file.flush()
+                                        last_z = z
+
+                                    print(
+                                        f"[{pc_time_str}] Node {node_id} | "
+                                        f"Micros: {start_micros:10d} | "
+                                        f"Z_last: {last_z:5d}"
+                                    )
+
                                     del raw_buffer[:PACKET_SIZE]
                                     continue
                                     
